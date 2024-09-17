@@ -392,6 +392,7 @@ class ExtractRaw(Process):
 
                 self.cur.consume_stream(self.msg_consumer)
             except Exception as err:
+                #TODO: the only issue I faced is continuous error of connection being closd -> SSL connection has been closed unexpectedly in postgres
                 logging.error(f"Error consuming stream from slot: '{self.slot_name}'. {err}")
                 if not self.reconnect():
                     logging.error("Failed to reconnect after several attempts. Exiting.")
