@@ -232,10 +232,12 @@ class LogicalReplicationReader:
         # this should be the type below but it doesn't work as the kwargs for create_model with mppy
         # schema_mapping_args: typing.Dict[str, typing.Tuple[type, typing.Optional[EllipsisType]]] = {
         schema_mapping_args: typing.Dict[str, typing.Any] = {
-            c.name: (convert_pg_type_to_py_type(c.type_name), None if c.optional else ...) for c in column_definitions
+            c.name: (typing.Optional[convert_pg_type_to_py_type(c.type_name)], None if c.optional else ...)
+            for c in column_definitions
         }
         self.table_models[relation_id] = pydantic.create_model(
-            f"DynamicSchemaModel_{relation_id}", **schema_mapping_args
+            f"DynamicSchemaModel_{relation_id}",
+            **schema_mapping_args
         )
 
         # key only schema definition
@@ -374,7 +376,13 @@ class ExtractRaw(Process):
         return False
 
     def run(self) -> None:
-        self.connect()
+        try:
+            self.connect()  # Attempt to establish connection
+        except Exception as err:
+            logging.error(f"Error connecting to the database: '{err}'")
+            self.close()  # Close to handle potential cleanup
+            return
+
         replication_options = {
             "publication_names": self.publication_name,
             "proto_version": "1"
@@ -392,7 +400,7 @@ class ExtractRaw(Process):
 
                 self.cur.consume_stream(self.msg_consumer)
             except Exception as err:
-                #TODO: the only issue I faced is continuous error of connection being closd -> SSL connection has been closed unexpectedly in postgres
+                #TODO: the only issue I faced is continuous error of connection being closd -> SSL connection has been closed unexpectedly in postgres(dev)/ server unexpectedly closing connections(prod)
                 logging.error(f"Error consuming stream from slot: '{self.slot_name}'. {err}")
                 if not self.reconnect():
                     logging.error("Failed to reconnect after several attempts. Exiting.")
@@ -423,5 +431,7 @@ class ExtractRaw(Process):
 
     def close(self) -> None:
         logging.info("Closing replication connection and cursor.")
-        self.cur.close()
-        self.conn.close()
+        if hasattr(self, 'cur') and self.cur:
+            self.cur.close()
+        if hasattr(self, 'conn') and self.conn:
+            self.conn.close()
