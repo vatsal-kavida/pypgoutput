@@ -97,6 +97,18 @@ def convert_pg_type_to_py_type(pg_type_name: str) -> type:
     else:
         return str
 
+def build_dsn(dsn: str, **kwargs) -> str:
+    """Build a DSN string with additional parameters for connection keepalive"""
+    dsn = psycopg2.extensions.make_dsn(dsn, **kwargs)
+    keepalive_options = {
+        "keepalives": 1,
+        "keepalives_idle": 7200,  # 30 seconds
+        "keepalives_interval": 30,  # 10 seconds
+        "keepalives_count": 10,  # Retry 5 times
+    }
+    keepalive_dsn = ' '.join(f'{key}={value}' for key, value in keepalive_options.items())
+    return f"{dsn} {keepalive_dsn}"
+
 
 class LogicalReplicationReader:
     """
@@ -119,6 +131,7 @@ class LogicalReplicationReader:
         self.dsn = psycopg2.extensions.make_dsn(dsn=dsn, **kwargs)
         self.publication_name = publication_name
         self.slot_name = slot_name
+        self.start_lsn = kwargs.get("start_lsn")
 
         # transform data containers
         self.table_schemas: typing.Dict[int, TableSchema] = dict()  # map relid to table schema
@@ -135,13 +148,15 @@ class LogicalReplicationReader:
     def setup(self) -> None:
         self.pipe_out_conn, self.pipe_in_conn = multiprocessing.Pipe(duplex=True)
         self.extractor = ExtractRaw(
-            pipe_conn=self.pipe_in_conn, dsn=self.dsn, publication_name=self.publication_name, slot_name=self.slot_name
+            pipe_conn=self.pipe_in_conn,
+            dsn=self.dsn,
+            publication_name=self.publication_name,
+            slot_name=self.slot_name,
+            start_lsn=self.start_lsn
         )
-        self.extractor.connect()
         self.extractor.start()
         self.source_db_handler = SourceDBHandler(dsn=self.dsn)
         self.database = self.source_db_handler.conn.get_dsn_parameters()["dbname"]
-        # TODO: make some aspect of this output configurable, raw msg return
         self.raw_msgs = self.read_raw_extracted()
         self.transformed_msgs = self.transform_raw(message_stream=self.raw_msgs)
 
@@ -331,61 +346,81 @@ class LogicalReplicationReader:
 
 
 class ExtractRaw(Process):
-    """
-    Consume logical replication messages using psycopg2's LogicalReplicationConnection. Run as a separate process
-    due to using consume_stream's endless loop. Consume msg sends data into a pipe for another process to extract
-
-    Docs:
-    https://www.psycopg.org/docs/extras.html#replication-support-objects
-    https://www.psycopg.org/docs/extras.html#psycopg2.extras.ReplicationCursor.consume_stream
-    """
-
-    def __init__(self, dsn: str, publication_name: str, slot_name: str, pipe_conn: Connection) -> None:
-        Process.__init__(self)
-        self.dsn = dsn
+    def __init__(self, dsn: str, publication_name: str, slot_name: str, pipe_conn: Connection,
+                 start_lsn: typing.Optional[int] = None) -> None:
+        super().__init__()
+        self.dsn = build_dsn(dsn)  # Use the function to build DSN with keepalive options
         self.publication_name = publication_name
         self.slot_name = slot_name
         self.pipe_conn = pipe_conn
+        self.start_lsn = start_lsn
 
     def connect(self) -> None:
+        logging.info("Connecting to the database with keepalive settings...")
         self.conn = psycopg2.extras.LogicalReplicationConnection(self.dsn)
         self.cur = psycopg2.extras.ReplicationCursor(self.conn)
 
-    def close(self) -> None:
-        if self.cur is not None:
-            self.cur.close()
-        if self.conn is not None:
-            self.conn.close()
+    def reconnect(self) -> bool:
+        attempts = 0
+        while attempts < 5:
+            try:
+                logging.info(f"Attempt #{attempts + 1} to reconnect...")
+                self.connect()
+                return True
+            except Exception as e:
+                logging.error(f"Reconnect attempt {attempts + 1} failed: {e}")
+                attempts += 1
+                time.sleep(5)
+        return False
 
     def run(self) -> None:
-        replication_options = {"publication_names": self.publication_name, "proto_version": "1"}
-        try:
-            self.cur.start_replication(slot_name=self.slot_name, decode=False, options=replication_options)
-        except psycopg2.ProgrammingError:
-            self.cur.create_replication_slot(self.slot_name, output_plugin="pgoutput")
-            self.cur.start_replication(slot_name=self.slot_name, decode=False, options=replication_options)
-        try:
-            logger.info(f"Starting replication from slot: '{self.slot_name}'")
-            self.cur.consume_stream(self.msg_consumer)
-        except Exception as err:
-            logger.error(f"Error consuming stream from slot: '{self.slot_name}'. {err}")
-            self.cur.close()
-            self.conn.close()
+        self.connect()
+        replication_options = {
+            "publication_names": self.publication_name,
+            "proto_version": "1"
+        }
+
+        while True:
+            try:
+                self.cur.start_replication(
+                    slot_name=self.slot_name,
+                    decode=False,
+                    options=replication_options,
+                    start_lsn=self.start_lsn if self.start_lsn else 0
+                )
+                logging.info(f"Starting replication from slot: '{self.slot_name}'")
+
+                self.cur.consume_stream(self.msg_consumer)
+            except Exception as err:
+                logging.error(f"Error consuming stream from slot: '{self.slot_name}'. {err}")
+                if not self.reconnect():
+                    logging.error("Failed to reconnect after several attempts. Exiting.")
+                    self.close()
+                    break
 
     def msg_consumer(self, msg: psycopg2.extras.ReplicationMessage) -> None:
-        message_id = uuid.uuid4()
-        message = ReplicationMessage(
-            message_id=message_id,
-            data_start=msg.data_start,
-            payload=msg.payload,
-            send_time=msg.send_time,
-            data_size=msg.data_size,
-            wal_end=msg.wal_end,
-        )
-        self.pipe_conn.send(message)
-        result = self.pipe_conn.recv()  # how would this wait until processing is done?
-        if result["id"] == message_id:
-            msg.cursor.send_feedback(flush_lsn=msg.data_start)
-            logger.debug(f"Flushed message: '{str(message_id)}'")
-        else:
-            logger.warning(f"Could not confirm message: {str(message_id)}. Did not flush at {str(msg.data_start)}")
+        try:
+            message_id = uuid.uuid4()
+            message = ReplicationMessage(
+                message_id=message_id,
+                data_start=msg.data_start,
+                payload=msg.payload,
+                send_time=msg.send_time,
+                data_size=msg.data_size,
+                wal_end=msg.wal_end,
+            )
+            self.pipe_conn.send(message)
+            result = self.pipe_conn.recv()  # wait until processing is done
+            if result["id"] == message_id:
+                msg.cursor.send_feedback(flush_lsn=msg.data_start)
+                logging.debug(f"Flushed message: '{str(message_id)}'")
+            else:
+                logging.warning(f"Could not confirm message: {str(message_id)}. Did not flush at {str(msg.data_start)}")
+        except Exception as e:
+            logging.error(f"Error in msg_consumer: {e}")
+            self.pipe_conn.send({'error': str(e)})
+
+    def close(self) -> None:
+        logging.info("Closing replication connection and cursor.")
+        self.cur.close()
+        self.conn.close()
